@@ -16,12 +16,14 @@ func buildArguments() *cli.App {
 			Description: "launches a proxy server that translates local ip addresses to the cluster-private IP addresses for a redis cluster",
 			Flags: []cli.Flag{
 				cli.StringFlag{
-					Name:   "listenAddr",
-					EnvVar: "LISTEN_ADDR",
+					Name:     "listenAddr",
+					EnvVar:   "LISTEN_ADDR",
+					Required: true,
 				},
 				cli.StringFlag{
-					Name:   "master",
-					EnvVar: "MASTER_ADDR",
+					Name:     "clusterAddr",
+					EnvVar:   "CLUSTER_ADDR",
+					Required: true,
 				},
 				cli.UintFlag{
 					Name:   "portStart",

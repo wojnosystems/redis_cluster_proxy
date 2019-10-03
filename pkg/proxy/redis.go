@@ -38,6 +38,9 @@ func NewRedis(listenAddr, clusterAddr string) *Redis {
 		ret.bufferPool.Put(make([]byte, ReadBufferSizeBytes))
 	}
 
+	// add the master node
+	ret.ipMap.Create(clusterAddr, listenAddr)
+
 	return ret
 }
 
@@ -92,6 +95,11 @@ func proxyConnection(conn net.Conn, bufferPool *sync.Pool, ipMap *ip_map.Concurr
 		buffer = buffer[0:readCount]
 		slots, err := deserializeClusterSlotServerResp(buffer)
 		_ = slots
+
+		// create a new socket for each slot, map it
+		for _, slot := range slots {
+
+		}
 	}
 }
 
