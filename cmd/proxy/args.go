@@ -3,6 +3,7 @@ package main
 import (
 	"github.com/urfave/cli"
 	"log"
+	"redis_cluster_proxy/pkg/ip_map"
 	"redis_cluster_proxy/pkg/proxy"
 )
 
@@ -31,8 +32,17 @@ func buildArguments() *cli.App {
 					EnvVar: "PORT_START",
 				},
 			},
-			Action: func(c *cli.Context) error {
-				log.Fatal(proxy.NewRedis(c.String("listenAddr"), c.String("master")).ListenAndServe())
+			Action: func(c *cli.Context) (err error) {
+				listenHostWithPort, err := ip_map.NewHostWithPortFromString(c.String("listenAddr"))
+				if err != nil {
+					return
+				}
+				clusterHostWithPort, err := ip_map.NewHostWithPortFromString(c.String("clusterAddr"))
+				if err != nil {
+					return
+				}
+
+				log.Fatal(proxy.NewRedis(listenHostWithPort, clusterHostWithPort).ListenAndServe())
 				return nil
 			},
 		},

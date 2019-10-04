@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -17,14 +18,14 @@ const (
 )
 
 type Redis struct {
-	listenAddr  string
-	clusterAddr string
+	listenAddr  ip_map.HostWithPort
+	clusterAddr ip_map.HostWithPort
 	bufferPool  *sync.Pool
 	ipMap       *ip_map.Concurrent
 	portKeeper  *port_pool.Keeper
 }
 
-func NewRedis(listenAddr, clusterAddr string) *Redis {
+func NewRedis(listenAddr, clusterAddr ip_map.HostWithPort) *Redis {
 	ret := &Redis{
 		listenAddr:  listenAddr,
 		clusterAddr: clusterAddr,
@@ -39,13 +40,14 @@ func NewRedis(listenAddr, clusterAddr string) *Redis {
 	}
 
 	// add the master node
+
 	ret.ipMap.Create(clusterAddr, listenAddr)
 
 	return ret
 }
 
 func (r *Redis) ListenAndServe() error {
-	listener, err := net.Listen("tcp", r.listenAddr)
+	listener, err := net.Listen("tcp", r.listenAddr.String())
 	if err != nil {
 		return err
 	}
@@ -55,13 +57,16 @@ func (r *Redis) ListenAndServe() error {
 			return err
 		}
 		go func(conn net.Conn) {
-			proxyConnection(conn, r.bufferPool, r.ipMap, r.portKeeper, r.clusterAddr)
+			err := proxyConnection(conn, r.bufferPool, r.ipMap, r.portKeeper, r.clusterAddr.String())
 			_ = conn.Close()
+			if err != nil {
+				log.Fatal(err)
+			}
 		}(conn)
 	}
 }
 
-func proxyConnection(conn net.Conn, bufferPool *sync.Pool, ipMap *ip_map.Concurrent, portKeeper *port_pool.Keeper, clusterAddr string) {
+func proxyConnection(conn net.Conn, bufferPool *sync.Pool, ipMap *ip_map.Concurrent, portKeeper *port_pool.Keeper, clusterAddr string) (err error) {
 	buffer := bufferPool.Get().([]byte)
 	if nil == buffer {
 		log.Println("ran out of buffers, so we cannot handle new connections, consider increasing MaxConnections")
@@ -98,7 +103,39 @@ func proxyConnection(conn net.Conn, bufferPool *sync.Pool, ipMap *ip_map.Concurr
 
 		// create a new socket for each slot, map it
 		for _, slot := range slots {
-
+			for serverIndex, server := range slot.servers {
+				remoteHostWithPort := ip_map.HostWithPort{Host: server.ip, Port: server.port}
+				if localSocket, exists := ipMap.RemoteToLocal(remoteHostWithPort); !exists {
+					// socket doesn't exist, spawn it, use a random address
+					nodeListener, err := net.Listen("tcp", "")
+					if err != nil {
+						return
+					}
+					localListenerHostWithPort, err := ip_map.NewHostWithPortFromString(nodeListener.Addr().String())
+					if err != nil {
+						return
+					}
+					// create the mapping entry for the new socket
+					ipMap.Create(remoteHostWithPort, localListenerHostWithPort)
+					go func(listener net.Listener) {
+						for {
+							listenerConn, err := listener.Accept()
+							if err != nil {
+								break
+							}
+							go func(listenerConn net.Conn) {
+								// TODO: continue implementing here
+								startNodeThread(remoteHostWithPort)
+								_ = listenerConn.Close()
+							}(listenerConn)
+						}
+					}(nodeListener)
+				} else {
+					// socket exists, swap it out
+					slot.servers[serverIndex].ip = localSocket.Host
+					slot.servers[serverIndex].port = localSocket.Port
+				}
+			}
 		}
 	}
 }
@@ -153,8 +190,29 @@ type clusterSlotResp struct {
 	rangeEnd   int
 	servers    []clusterServerResp
 }
+
+func clusterSlotRespToRedisStream(c clusterSlotResp) []string {
+	resp := make([]string, 4)
+	resp[0] = "*3"
+	resp[1] = fmt.Sprintf(":%d", c.rangeStart)
+	resp[2] = fmt.Sprintf(":%d", c.rangeEnd)
+	resp[3] = fmt.Sprintf("*%d", len(c.servers))
+	return resp
+}
+
 type clusterServerResp struct {
 	ip   string
 	port int
 	id   string
+}
+
+func clusterServerRespToRedisStream(c clusterServerResp) []string {
+	resp := make([]string, 6)
+	resp[0] = "*3"
+	resp[1] = fmt.Sprintf("$%d", len(c.ip))
+	resp[2] = c.ip
+	resp[3] = fmt.Sprintf(":%d", c.port)
+	resp[4] = fmt.Sprintf("$%d", len(c.id))
+	resp[5] = c.id
+	return resp
 }
