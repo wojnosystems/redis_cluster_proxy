@@ -36,3 +36,13 @@ func (c *Concurrent) RemoteToLocal(remoteAddr HostWithPort) (local HostWithPort,
 	local, ok = c.remoteToLocal[remoteAddr]
 	return
 }
+
+func (c *Concurrent) SnapshotLocalsToRemotes() (ret map[HostWithPort]HostWithPort) {
+	ret = make(map[HostWithPort]HostWithPort)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for key, value := range c.localToRemote {
+		ret[key] = value
+	}
+	return
+}

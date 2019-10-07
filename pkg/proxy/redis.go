@@ -2,62 +2,209 @@ package proxy
 
 import (
 	"fmt"
+	"github.com/wojnosystems/retry"
 	"io"
 	"log"
 	"net"
 	"redis_cluster_proxy/pkg/ip_map"
 	"redis_cluster_proxy/pkg/port_pool"
-	"strconv"
+	redispkg "redis_cluster_proxy/pkg/redis"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
-	MaxConnections      = 100
-	ReadBufferSizeBytes = 1024
+	MaxConnections           = 100
+	MaxConcurrentConnections = 10
+	ReadBufferSizeBytes      = 1024
 )
 
 type Redis struct {
-	listenAddr  ip_map.HostWithPort
-	clusterAddr ip_map.HostWithPort
-	bufferPool  *sync.Pool
-	ipMap       *ip_map.Concurrent
-	portKeeper  *port_pool.Keeper
+	listenAddr        ip_map.HostWithPort
+	clusterAddr       ip_map.HostWithPort
+	bufferPool        *bufferPool
+	connPool          *connPool
+	ipMap             *ip_map.Concurrent
+	portCounter       port_pool.Counter
+	listenerWaitGroup *sync.WaitGroup
+
+	listenIPs              []net.IP
+	clusterIPs             []net.IP
+	facadeClusterSlotsResp []redispkg.ClusterSlotResp
 }
 
-func NewRedis(listenAddr, clusterAddr ip_map.HostWithPort) *Redis {
+func NewRedis(listenAddr, clusterAddr ip_map.HostWithPort, portKeeper port_pool.Counter) (redis *Redis) {
 	ret := &Redis{
-		listenAddr:  listenAddr,
-		clusterAddr: clusterAddr,
-		bufferPool: &sync.Pool{New: func() interface{} {
-			return nil
-		}},
-		ipMap:      ip_map.NewConcurrent(),
-		portKeeper: port_pool.NewKeeper(0),
+		listenAddr:        listenAddr,
+		clusterAddr:       clusterAddr,
+		bufferPool:        newBufferPool(MaxConnections, ReadBufferSizeBytes),
+		connPool:          newConnPool(MaxConcurrentConnections),
+		ipMap:             ip_map.NewConcurrent(),
+		portCounter:       portKeeper,
+		listenerWaitGroup: &sync.WaitGroup{},
 	}
-	for i := 0; i < MaxConnections; i++ {
-		ret.bufferPool.Put(make([]byte, ReadBufferSizeBytes))
-	}
-
-	// add the master node
-
-	ret.ipMap.Create(clusterAddr, listenAddr)
 
 	return ret
 }
 
-func (r *Redis) ListenAndServe() error {
-	listener, err := net.Listen("tcp", r.listenAddr.String())
+var MaxConnectRetries = retry.MaxAttempts{
+	Times:   30,
+	WaitFor: 2 * time.Second,
+}
+
+const DiscoverStatement = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nslots\r\n"
+
+// DiscoverAndListen contacts the cluster and gets the list of nodes, then establishes proxies for each node
+// When contacting redis, we get back a list of server addresses WITHIN the cluster These are private addresses)
+// Each of these needs to be recorded in the map. A new port needs to be created locally and that port will map to the remote address
+// Suppose we're listening on 127.0.0.1:8000 - 8005. And the Redis Cluster listens on 172.20.0.2:7000 - 7005.
+// When a request comes into 127.0.0.1, it needs to be forwarded to 172.20.0.2. The ports don't really matter so long as they are consistent.
+// When a client requests the mapping, we should respond with our own, internal mapping, based on the "listenAddr".
+func (r *Redis) DiscoverAndListen(clusterIpAndPort ip_map.HostWithPort) (err error) {
+	log.Printf("Resolving clusterAddr: %s\n", r.clusterAddr.Host)
+	err = r.resolveClusterAddrIP()
 	if err != nil {
-		return err
+		return
 	}
+
+	var cluster net.Conn
+
+	err = retry.How(MaxConnectRetries.New()).This(func(controller retry.ServiceController) error {
+		cluster, err = net.Dial("tcp", r.clusterAddr.String())
+		return err
+	})
+	if err != nil {
+		return
+	}
+
+	// close the connection to Redis
+	defer func() { _ = cluster.Close() }()
+
+	_, err = cluster.Write([]byte(DiscoverStatement))
+	if err != nil && io.EOF != err {
+		log.Println("io error while writing to cluster socket: " + err.Error())
+		return
+	}
+
+	buffer := r.bufferPool.Get()
+	r.facadeClusterSlotsResp, _, err = redispkg.DeserializeClusterSlotServerResp(cluster, buffer)
+	if err != nil && io.EOF != err {
+		log.Println("io error while reading cluster socket: " + err.Error())
+		return
+	}
+
+	serverAddrs := serverAddrAndPortFromSlotResp(r.facadeClusterSlotsResp)
+	for _, serverAddr := range serverAddrs {
+		if _, exists := r.ipMap.RemoteToLocal(serverAddr); exists {
+			// already exists, do nothing
+		} else {
+			// No mapping exists, open a socket to service it
+			var nodeListener net.Listener
+			newListenerAddr := ip_map.HostWithPort{
+				Host: "", // we don't want to bind to any hostname, bind to all available interfaces
+				Port: 0,
+			}
+			newListenerAddr.Port, err = r.portCounter.Next()
+			if err != nil {
+				return
+			}
+			nodeListener, err = net.Listen("tcp", newListenerAddr.String())
+			if err != nil {
+				return
+			}
+			// create the mapping entry for the new socket
+			r.ipMap.Create(serverAddr, ip_map.HostWithPort{Host: r.listenAddr.Host, Port: newListenerAddr.Port})
+
+			r.listenerWaitGroup.Add(1)
+			go func(nodeListener net.Listener, newListenerAddr ip_map.HostWithPort) {
+				_ = listenLoop(nodeListener, r, newListenerAddr)
+				r.listenerWaitGroup.Done()
+			}(nodeListener, newListenerAddr)
+		}
+	}
+
+	for slotIndex, slot := range r.facadeClusterSlotsResp {
+		for serverIndex, server := range slot.Servers() {
+			facadeHostWithPort := ip_map.HostWithPort{
+				Host: server.Ip(),
+				Port: server.Port(),
+			}
+			var localAddr ip_map.HostWithPort
+			localAddr, err = remoteToLocalHostAndPort(r.ipMap, facadeHostWithPort)
+			if err != nil {
+				return
+			}
+			r.facadeClusterSlotsResp[slotIndex].Servers()[serverIndex].SetIp(localAddr.Host)
+		}
+	}
+	return nil
+}
+
+func (r *Redis) resolveClusterAddrIP() (err error) {
+	if len(r.clusterAddr.Host) == 0 {
+		return
+	}
+	clusterIp := net.ParseIP(r.clusterAddr.Host)
+	if clusterIp != nil {
+		r.clusterIPs = []net.IP{clusterIp}
+	} else {
+		err = retry.How(MaxConnectRetries.New()).This(func(controller retry.ServiceController) error {
+			r.clusterIPs, err = net.LookupIP(r.clusterAddr.Host)
+			return err
+		})
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (r Redis) PrintConnectionStatuses(writer io.Writer) (err error) {
+	localToRemotes := r.ipMap.SnapshotLocalsToRemotes()
+	keys := make([]ip_map.HostWithPort, 0, len(localToRemotes))
+	for local, _ := range localToRemotes {
+		keys = append(keys, local)
+	}
+	// sort the keys for easier reading
+	sort.Slice(keys, func(i, j int) bool {
+		return strings.Compare(keys[i].String(), keys[j].String()) <= 0
+	})
+	for _, local := range keys {
+		// This is being reported so that people connecting to the cluster, in case they need to debug
+		_, err = fmt.Fprintf(writer, "Listening on: %s proxy to: %s\n", local.String(), localToRemotes[local].String())
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+
+func serverAddrAndPortFromSlotResp(clusterSlotResponses []redispkg.ClusterSlotResp) (hostAndPort []ip_map.HostWithPort) {
+	hostAndPort = make([]ip_map.HostWithPort, 0, 10)
+	for _, slot := range clusterSlotResponses {
+		for _, server := range slot.Servers() {
+			hostAndPort = append(hostAndPort, ip_map.HostWithPort{Host: server.Ip(), Port: server.Port()})
+		}
+	}
+	return hostAndPort
+}
+
+// ListenAndServe waits for a connection requests
+func (r *Redis) WaitUntilAddConnectionsComplete() (err error) {
+	r.listenerWaitGroup.Wait()
+	return nil
+}
+
+func listenLoop(listener net.Listener, r *Redis, localAddr ip_map.HostWithPort) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			return err
 		}
 		go func(conn net.Conn) {
-			err := proxyConnection(conn, r.bufferPool, r.ipMap, r.portKeeper, r.clusterAddr.String())
+			err = proxyConnection(conn, r, localAddr)
 			_ = conn.Close()
 			if err != nil {
 				log.Fatal(err)
@@ -66,153 +213,101 @@ func (r *Redis) ListenAndServe() error {
 	}
 }
 
-func proxyConnection(conn net.Conn, bufferPool *sync.Pool, ipMap *ip_map.Concurrent, portKeeper *port_pool.Keeper, clusterAddr string) (err error) {
-	buffer := bufferPool.Get().([]byte)
+func proxyConnection(conn net.Conn, r *Redis, localAddr ip_map.HostWithPort) (err error) {
+	buffer := r.bufferPool.Get()
 	if nil == buffer {
 		log.Println("ran out of buffers, so we cannot handle new connections, consider increasing MaxConnections")
 		return
 	}
-	defer func() {
-		buffer = buffer[0:cap(buffer)]
-		for i := 0; i < len(buffer); i++ {
-			buffer[i] = 0x0
-		}
-		bufferPool.Put(buffer)
-	}()
+	defer r.bufferPool.Put(buffer)
 
-	readCount, err := conn.Read(buffer)
+	var parsedInboundCommand []string
+	parsedInboundCommand, err = readRedisToStatement(conn, buffer)
+	if err != nil {
+		return
+	}
+
+	// If it's a cluster query, intercept it and respond back with our own internal mapping
+	if isClusterSlotsQuery(parsedInboundCommand) {
+		// reply back with the modified request
+		// This is where we "lie" to the client.
+		_, err = redispkg.ClusterSlotsRespToRedisStream(conn, r.facadeClusterSlotsResp)
+		if err != nil {
+			return
+		}
+	}
+
+	// some other request, proxy it
+	clusterAddr, err := localToRemoteHostAndPort(r.ipMap, localAddr)
+	if err != nil {
+		return
+	}
+	var clusterConn net.Conn
+	clusterConn, err = r.connPool.Dial(clusterAddr.String())
+	if err != nil {
+		return
+	}
+
+	var buffer1, buffer2 []byte
+	buffer1, buffer2, err = r.getTwoBuffers()
+	if err != nil {
+		return
+	}
+	defer r.bufferPool.Put(buffer1)
+	defer r.bufferPool.Put(buffer2)
+	Bidirectional(conn, clusterConn, buffer1, buffer2)
+
+	return nil
+}
+
+func (r *Redis) getTwoBuffers() (buffer1, buffer2 []byte, err error) {
+	buffer1 = r.bufferPool.Get()
+	buffer2 = r.bufferPool.Get()
+	if buffer1 == nil || buffer2 == nil {
+		if buffer1 != nil {
+			r.bufferPool.Put(buffer1)
+		}
+		if buffer2 != nil {
+			r.bufferPool.Put(buffer2)
+		}
+		err = fmt.Errorf("bufferPool exhausted, consider increasing NumberOfBuffers")
+		return
+	}
+	return
+}
+
+func localToRemoteHostAndPort(concurrent *ip_map.Concurrent, localAddr ip_map.HostWithPort) (remoteAddr ip_map.HostWithPort, err error) {
+	var ok bool
+	remoteAddr, ok = concurrent.LocalToRemote(localAddr)
+	if !ok {
+		err = fmt.Errorf("unable to find local to cluster mapping for localAddr: %s", localAddr.String())
+		return
+	}
+	return
+}
+
+func remoteToLocalHostAndPort(concurrent *ip_map.Concurrent, remoteAddr ip_map.HostWithPort) (localAddr ip_map.HostWithPort, err error) {
+	var ok bool
+	localAddr, ok = concurrent.RemoteToLocal(remoteAddr)
+	if !ok {
+		err = fmt.Errorf("unable to find local to cluster mapping for remoteAddr: %s", remoteAddr.String())
+		return
+	}
+	return
+}
+
+func readRedisToStatement(conn net.Conn, buffer []byte) (statements []string, err error) {
+	var readCount int
+	readCount, err = conn.Read(buffer)
 	if err != nil && io.EOF != err {
 		log.Println("io error while reading local socket: " + err.Error())
 		return
 	}
+
 	buffer = buffer[0:readCount]
-	parts := strings.Split(string(buffer), "\r\n")
-	if parts[2] == "CLUSTER" && parts[4] == "slots" {
-		// connection is attempting to query the cluster, forward the request
-		cluster, err := net.Dial("tcp", clusterAddr)
-		if err != nil {
-			log.Fatal("unable to connect to the redis cluster at: " + clusterAddr)
-		}
-		_, _ = cluster.Write(buffer)
-		// get the repsonse back from the actual redis system
-		buffer = buffer[0:cap(buffer)]
-		readCount, err = cluster.Read(buffer)
-		buffer = buffer[0:readCount]
-		slots, err := deserializeClusterSlotServerResp(buffer)
-		_ = slots
-
-		// create a new socket for each slot, map it
-		for _, slot := range slots {
-			for serverIndex, server := range slot.servers {
-				remoteHostWithPort := ip_map.HostWithPort{Host: server.ip, Port: server.port}
-				if localSocket, exists := ipMap.RemoteToLocal(remoteHostWithPort); !exists {
-					// socket doesn't exist, spawn it, use a random address
-					nodeListener, err := net.Listen("tcp", "")
-					if err != nil {
-						return
-					}
-					localListenerHostWithPort, err := ip_map.NewHostWithPortFromString(nodeListener.Addr().String())
-					if err != nil {
-						return
-					}
-					// create the mapping entry for the new socket
-					ipMap.Create(remoteHostWithPort, localListenerHostWithPort)
-					go func(listener net.Listener) {
-						for {
-							listenerConn, err := listener.Accept()
-							if err != nil {
-								break
-							}
-							go func(listenerConn net.Conn) {
-								// TODO: continue implementing here
-								startNodeThread(remoteHostWithPort)
-								_ = listenerConn.Close()
-							}(listenerConn)
-						}
-					}(nodeListener)
-				} else {
-					// socket exists, swap it out
-					slot.servers[serverIndex].ip = localSocket.Host
-					slot.servers[serverIndex].port = localSocket.Port
-				}
-			}
-		}
-	}
+	return strings.Split(string(buffer), "\r\n"), err
 }
 
-func deserializeClusterSlotServerResp(buffer []byte) (servers []clusterSlotResp, err error) {
-	// https://redis.io/topics/protocol
-	statements := strings.Split(string(buffer), "\r\n")
-	numServers := 0
-	numServers, err = strconv.Atoi(statements[0][1:])
-	servers = make([]clusterSlotResp, numServers)
-	statements = statements[1:]
-	offset := 0
-	for serverIndex := 0; serverIndex < numServers; serverIndex++ {
-		servers[serverIndex], offset, err = deserializeSlot(statements)
-		statements = statements[offset:]
-	}
-
-	return
-}
-
-func deserializeSlot(statements []string) (slot clusterSlotResp, skipStatements int, err error) {
-	records := 0
-	records, err = strconv.Atoi(statements[0][1:])
-	skipStatements++
-	if err != nil {
-		return
-	}
-	slot.rangeStart, err = strconv.Atoi(statements[1][1:])
-	skipStatements++
-	if err != nil {
-		return
-	}
-	slot.rangeEnd, err = strconv.Atoi(statements[2][1:])
-	skipStatements++
-	if err != nil {
-		return
-	}
-	serverCount := records - 2
-	slot.servers = make([]clusterServerResp, serverCount)
-	for serverIndex := 0; serverIndex < len(slot.servers); serverIndex++ {
-		skipStatements++ // Skipping the *3, all server records have 3 items: IP, port, and id
-		slot.servers[serverIndex].ip = statements[skipStatements+1]
-		slot.servers[serverIndex].port, err = strconv.Atoi(statements[skipStatements+2][1:])
-		slot.servers[serverIndex].id = statements[skipStatements+4]
-		skipStatements += 5
-	}
-	return
-}
-
-type clusterSlotResp struct {
-	rangeStart int
-	rangeEnd   int
-	servers    []clusterServerResp
-}
-
-func clusterSlotRespToRedisStream(c clusterSlotResp) []string {
-	resp := make([]string, 4)
-	resp[0] = "*3"
-	resp[1] = fmt.Sprintf(":%d", c.rangeStart)
-	resp[2] = fmt.Sprintf(":%d", c.rangeEnd)
-	resp[3] = fmt.Sprintf("*%d", len(c.servers))
-	return resp
-}
-
-type clusterServerResp struct {
-	ip   string
-	port int
-	id   string
-}
-
-func clusterServerRespToRedisStream(c clusterServerResp) []string {
-	resp := make([]string, 6)
-	resp[0] = "*3"
-	resp[1] = fmt.Sprintf("$%d", len(c.ip))
-	resp[2] = c.ip
-	resp[3] = fmt.Sprintf(":%d", c.port)
-	resp[4] = fmt.Sprintf("$%d", len(c.id))
-	resp[5] = c.id
-	return resp
+func isClusterSlotsQuery(statements []string) bool {
+	return len(statements) > 5 && statements[2] == "CLUSTER" && statements[4] == "slots"
 }

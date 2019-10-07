@@ -8,7 +8,7 @@ import (
 
 type HostWithPort struct {
 	Host string
-	Port int
+	Port uint16
 }
 
 func NewHostWithPortFromString(hostColonPort string) (hostWithPort HostWithPort, err error) {
@@ -17,7 +17,11 @@ func NewHostWithPortFromString(hostColonPort string) (hostWithPort HostWithPort,
 	if err != nil {
 		return
 	}
-	hostWithPort.Port, err = strconv.Atoi(portString)
+	portUInt64, err := strconv.ParseUint(portString, 10, 16)
+	if err != nil {
+		return
+	}
+	hostWithPort.Port = uint16(portUInt64)
 	return
 }
 

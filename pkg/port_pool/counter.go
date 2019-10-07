@@ -5,19 +5,23 @@ import (
 	"sync"
 )
 
-type Keeper struct {
+type Counter interface {
+	Next() (uint16, error)
+}
+
+type counter struct {
 	mu      *sync.Mutex
 	counter uint16
 }
 
-func NewKeeper(startAt uint16) *Keeper {
-	return &Keeper{
+func NewCounter(startAt uint16) Counter {
+	return &counter{
 		mu:      &sync.Mutex{},
 		counter: startAt,
 	}
 }
 
-func (k *Keeper) Next() (int, error) {
+func (k *counter) Next() (uint16, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if 0 == k.counter {
@@ -25,5 +29,5 @@ func (k *Keeper) Next() (int, error) {
 	}
 	ret := k.counter
 	k.counter++
-	return int(ret), nil
+	return ret, nil
 }
