@@ -25,7 +25,7 @@ func buildArguments() *cli.App {
 		{
 			Name:        "server",
 			Usage:       "proxy local redis cluster requests to a private cluster",
-			UsageText:   "server -listenAddr=LOCAL_ADDR:LOCAL_PORT -clusterAddr=CLUSTER_ADDR:CLUSTER_PORT",
+			UsageText:   "server -listenAddr LOCAL_ADDR:LOCAL_PORT -clusterAddr CLUSTER_ADDR:CLUSTER_PORT",
 			Description: "launches a proxy server that translates local ip addresses to the cluster-private IP addresses for a redis cluster",
 			Flags: []cli.Flag{
 				cli.StringFlag{
@@ -40,21 +40,11 @@ func buildArguments() *cli.App {
 				},
 			},
 			Action: func(c *cli.Context) (err error) {
-				listenHostWithPort, err := ip_map.NewHostWithPortFromString(c.String(ListenAddrName))
-				if err != nil {
-					return
-				}
-				clusterHostWithPort, err := ip_map.NewHostWithPortFromString(c.String(ClusterAddrName))
-				if err != nil {
-					return
-				}
-
-				portKeeper := port_pool.NewCounter(listenHostWithPort.Port)
-
-				redisProxy := proxy.NewRedis(listenHostWithPort, clusterHostWithPort, portKeeper)
+				var redisProxy *proxy.Redis
+				redisProxy, err = newProxy(c.String(ListenAddrName), c.String(ClusterAddrName))
 
 				// Discovers the cluster ips and ports
-				err = redisProxy.DiscoverAndListen(clusterHostWithPort)
+				err = redisProxy.DiscoverAndListen()
 				if err != nil {
 					log.Fatal(err)
 				}
@@ -71,4 +61,20 @@ func buildArguments() *cli.App {
 		},
 	}
 	return app
+}
+
+func newProxy(listenAddr, clusterAddr string) (redisProxy *proxy.Redis, err error) {
+
+	listenHostWithPort, err := ip_map.NewHostWithPortFromString(listenAddr)
+	if err != nil {
+		return
+	}
+	clusterHostWithPort, err := ip_map.NewHostWithPortFromString(clusterAddr)
+	if err != nil {
+		return
+	}
+
+	portKeeper := port_pool.NewCounter(listenHostWithPort.Port)
+
+	return proxy.NewRedis(listenHostWithPort, clusterHostWithPort, portKeeper), nil
 }

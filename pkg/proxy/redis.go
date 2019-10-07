@@ -8,7 +8,7 @@ import (
 	"net"
 	"redis_cluster_proxy/pkg/ip_map"
 	"redis_cluster_proxy/pkg/port_pool"
-	redispkg "redis_cluster_proxy/pkg/redis"
+	redisPkg "redis_cluster_proxy/pkg/redis"
 	"sort"
 	"strings"
 	"sync"
@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	MaxConnections           = 100
-	MaxConcurrentConnections = 10
+	MaxConnections           = 1000
+	MaxConcurrentConnections = 100
 	ReadBufferSizeBytes      = 1024
 )
 
@@ -32,7 +32,7 @@ type Redis struct {
 
 	listenIPs              []net.IP
 	clusterIPs             []net.IP
-	facadeClusterSlotsResp []redispkg.ClusterSlotResp
+	facadeClusterSlotsResp []redisPkg.ClusterSlotResp
 }
 
 func NewRedis(listenAddr, clusterAddr ip_map.HostWithPort, portKeeper port_pool.Counter) (redis *Redis) {
@@ -62,7 +62,7 @@ const DiscoverStatement = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nslots\r\n"
 // Suppose we're listening on 127.0.0.1:8000 - 8005. And the Redis Cluster listens on 172.20.0.2:7000 - 7005.
 // When a request comes into 127.0.0.1, it needs to be forwarded to 172.20.0.2. The ports don't really matter so long as they are consistent.
 // When a client requests the mapping, we should respond with our own, internal mapping, based on the "listenAddr".
-func (r *Redis) DiscoverAndListen(clusterIpAndPort ip_map.HostWithPort) (err error) {
+func (r *Redis) DiscoverAndListen() (err error) {
 	log.Printf("Resolving clusterAddr: %s\n", r.clusterAddr.Host)
 	err = r.resolveClusterAddrIP()
 	if err != nil {
@@ -89,7 +89,7 @@ func (r *Redis) DiscoverAndListen(clusterIpAndPort ip_map.HostWithPort) (err err
 	}
 
 	buffer := r.bufferPool.Get()
-	r.facadeClusterSlotsResp, _, err = redispkg.DeserializeClusterSlotServerResp(cluster, buffer)
+	r.facadeClusterSlotsResp, _, err = redisPkg.DeserializeClusterSlotServerResp(cluster, buffer)
 	if err != nil && io.EOF != err {
 		log.Println("io error while reading cluster socket: " + err.Error())
 		return
@@ -164,7 +164,7 @@ func (r *Redis) resolveClusterAddrIP() (err error) {
 func (r Redis) PrintConnectionStatuses(writer io.Writer) (err error) {
 	localToRemotes := r.ipMap.SnapshotLocalsToRemotes()
 	keys := make([]ip_map.HostWithPort, 0, len(localToRemotes))
-	for local, _ := range localToRemotes {
+	for local := range localToRemotes {
 		keys = append(keys, local)
 	}
 	// sort the keys for easier reading
@@ -181,7 +181,7 @@ func (r Redis) PrintConnectionStatuses(writer io.Writer) (err error) {
 	return
 }
 
-func serverAddrAndPortFromSlotResp(clusterSlotResponses []redispkg.ClusterSlotResp) (hostAndPort []ip_map.HostWithPort) {
+func serverAddrAndPortFromSlotResp(clusterSlotResponses []redisPkg.ClusterSlotResp) (hostAndPort []ip_map.HostWithPort) {
 	hostAndPort = make([]ip_map.HostWithPort, 0, 10)
 	for _, slot := range clusterSlotResponses {
 		for _, server := range slot.Servers() {
@@ -231,7 +231,7 @@ func proxyConnection(conn net.Conn, r *Redis, localAddr ip_map.HostWithPort) (er
 	if isClusterSlotsQuery(parsedInboundCommand) {
 		// reply back with the modified request
 		// This is where we "lie" to the client.
-		_, err = redispkg.ClusterSlotsRespToRedisStream(conn, r.facadeClusterSlotsResp)
+		_, err = redisPkg.ClusterSlotsRespToRedisStream(conn, r.facadeClusterSlotsResp)
 		if err != nil {
 			return
 		}
