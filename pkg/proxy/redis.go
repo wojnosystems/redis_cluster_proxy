@@ -245,6 +245,11 @@ func proxyConnection(conn net.Conn, r *Redis, localAddr ip_map.HostWithPort) (er
 	var clusterConn net.Conn
 	clusterConn, err = r.connPool.Dial(clusterAddr.String())
 	if err != nil {
+		if err == ErrPoolDepleted {
+			// silently fail
+			log.Println("conn pool depleted")
+			return nil
+		}
 		return
 	}
 

@@ -25,6 +25,8 @@ func newConnPool(maxConnectionsPerTarget int) *connPool {
 	}
 }
 
+var ErrPoolDepleted = fmt.Errorf("no connections available")
+
 func (c *connPool) Dial(destinationAddr string) (conn net.Conn, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -43,7 +45,7 @@ func (c *connPool) Dial(destinationAddr string) (conn net.Conn, err error) {
 		conn = connEntry.Get()
 	}
 	if conn == nil {
-		err = fmt.Errorf("no connections available")
+		return nil, ErrPoolDepleted
 	}
 	// wrap the connection so that it auto-returns to the pool when Close is called
 	conn = newPooledConnection(c, conn)
