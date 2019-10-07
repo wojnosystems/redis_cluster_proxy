@@ -18,6 +18,12 @@ Where ports 8000 - 8005 and 7000 - 7005 are exposed in your docker-compose.yaml 
 
 There is a docker-compose.yaml in the root of the project. It using [grokzen's Redis Cluster](https://github.com/Grokzen/docker-redis-cluster) [docker image](https://hub.docker.com/r/grokzen/redis-cluster/) to test.
 
+```bash
+docker-compose up
+```
+
+Target your Redis Cluster client to: `127.0.0.1:8000`.
+
 ### More on the setup
 
 Suppose you have a [Redis Cluster](https://redis.io/topics/cluster-tutorial) with 3 masters and 3 replicas with the following IP addresses:
@@ -69,6 +75,8 @@ The included docker-compose.yaml file contains a simple configuration. Note the 
 # Purpose
 
 I needed a [Redis Cluster](https://redis.io/topics/cluster-tutorial) with at least 3 master nodes running in a Docker cluster as I was testing the JedisCluster (Java redis cluster SDK client). However, because Redis uses IP addresses when connecting to the cluster from a client and those IP addresses aren't routable outside of the cluster, it is not possible to access a redis cluster directly. However, by using a proxy with the ability to rename IP addresses, it is possible to support external connections.
+
+Read up on [additional history](https://github.com/antirez/redis/issues/2527) on this problem.
 
 # Caveats
 
