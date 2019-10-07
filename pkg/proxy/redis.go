@@ -252,6 +252,7 @@ func proxyConnection(conn net.Conn, r *Redis, localAddr ip_map.HostWithPort) (er
 		}
 		return
 	}
+	defer func() { _ = clusterConn.Close() }()
 
 	var buffer1, buffer2 []byte
 	buffer1, buffer2, err = r.getTwoBuffers()
