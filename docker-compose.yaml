@@ -15,7 +15,7 @@ services:
     image: redis-cluster-proxy:latest
     build:
       context: .
-      dockerfile: ./docker/Dockerfile
+      dockerfile: Dockerfile
     environment:
       - LISTEN_ADDR=:8000
       - CLUSTER_ADDR=cluster:7000
