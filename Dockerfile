@@ -9,6 +9,7 @@ COPY cmd cmd
 COPY pkg pkg
 RUN mkdir -p target
 RUN cd cmd/proxy && \
+    CGO_ENABLED=0 go test -run="" /tmp/build/pkg/* && \
     go build -i -o /tmp/build/target/redisClusterProxyServer .
 
 FROM alpine:3.10.2
