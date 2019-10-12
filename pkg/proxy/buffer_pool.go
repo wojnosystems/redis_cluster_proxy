@@ -22,7 +22,11 @@ func newBufferPool(numberOfBuffers, bufferSizeInBytes int) *bufferPool {
 }
 
 func (b *bufferPool) Get() (buffer []byte) {
-	return b.pool.Get().([]byte)
+	ret := b.pool.Get()
+	if ret == nil {
+		return nil
+	}
+	return ret.([]byte)
 }
 
 func (b *bufferPool) Put(buffer []byte) {

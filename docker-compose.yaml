@@ -2,13 +2,6 @@ version: '3'
 services:
   cluster:
     image: grokzen/redis-cluster:5.0.5
-    ports:
-      - "7000:7000"
-      - "7001:7001"
-      - "7002:7002"
-      - "7003:7003"
-      - "7004:7004"
-      - "7005:7005"
   proxy:
     depends_on:
       - cluster
@@ -19,7 +12,8 @@ services:
     environment:
       - LISTEN_ADDR=:8000
       - CLUSTER_ADDR=cluster:7000
-      - START_DELAY=10s
+      - PUBLIC_HOSTNAME=127.0.0.1
+      - START_DELAY=1s
     ports:
       - "8000:8000"
       - "8001:8001"

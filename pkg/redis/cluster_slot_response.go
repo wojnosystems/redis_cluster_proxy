@@ -2,13 +2,40 @@ package redis
 
 import (
 	"fmt"
-	"io"
 )
 
 type ClusterSlotResp struct {
 	rangeStart int
 	rangeEnd   int
 	servers    []ClusterServerResp
+}
+
+func NewClusterSlotResp(rangeStart, rangeEnd int, servers []ClusterServerResp) ClusterSlotResp {
+	return ClusterSlotResp{
+		rangeStart: rangeStart,
+		rangeEnd:   rangeEnd,
+		servers:    servers,
+	}
+}
+
+func NewClusterSlotRespFromClusterSlotRespArray(in []ClusterSlotResp) (ret []ClusterSlotResp) {
+	ret = make([]ClusterSlotResp, len(in))
+	for slotIndex, inSlot := range in {
+		ret[slotIndex] = NewClusterSlotRespFromClusterSlotResp(inSlot)
+	}
+	return
+}
+
+func NewClusterSlotRespFromClusterSlotResp(r ClusterSlotResp) ClusterSlotResp {
+	ret := ClusterSlotResp{
+		rangeStart: r.rangeStart,
+		rangeEnd:   r.rangeEnd,
+		servers:    make([]ClusterServerResp, len(r.servers)),
+	}
+	for serverIndex, rServer := range r.servers {
+		ret.servers[serverIndex] = NewClusterServerRespFromClusterServerResp(rServer)
+	}
+	return ret
 }
 
 func (c ClusterSlotResp) RangeStart() int {
@@ -21,74 +48,52 @@ func (c ClusterSlotResp) Servers() []ClusterServerResp {
 	return c.servers
 }
 
-func ClusterSlotsRespToRedisStream(writer io.Writer, c []ClusterSlotResp) (bytesWrittenTotal int, err error) {
-	var bytesWritten int
-	bytesWritten, err = fmt.Fprintf(writer, "*%d\r\n", len(c))
-	if err != nil {
-		return bytesWritten, err
+func ClusterSlotArrayRespToComponent(c []ClusterSlotResp) (componenter Componenter) {
+	slotArray := make(Array, len(c))
+	for slotIndex, slot := range c {
+		slotArray[slotIndex] = ClusterSlotRespToComponent(slot)
 	}
-	bytesWrittenTotal += bytesWritten
-	for _, slot := range c {
-		bytesWritten, err = ClusterSlotRespToRedisStream(writer, slot)
-		if err != nil {
-			return bytesWritten, err
-		}
-		bytesWrittenTotal += bytesWritten
-	}
-	return
+	return &slotArray
 }
 
-func ClusterSlotRespToRedisStream(writer io.Writer, c ClusterSlotResp) (bytesWrittenTotal int, err error) {
-	var bytesWritten int
-	bytesWritten, err = fmt.Fprintf(writer, "*%d\r\n:%d\r\n:%d\r\n", len(c.servers)+2, c.rangeStart, c.rangeEnd)
-	if err != nil {
-		return bytesWritten, err
+func ClusterSlotRespToComponent(c ClusterSlotResp) Componenter {
+	slotComponent := make(Array, 2+len(c.servers))
+	slotComponent[0] = NewIntFromInt(c.rangeStart)
+	slotComponent[1] = NewIntFromInt(c.rangeEnd)
+	for serverIndex := 2; serverIndex < len(slotComponent); serverIndex++ {
+		slotComponent[serverIndex] = ClusterServerRespToComponent(c.servers[serverIndex-2])
 	}
-	bytesWrittenTotal += bytesWritten
-
-	for _, server := range c.servers {
-		bytesWritten, err = ClusterServerRespToRedisStream(writer, server)
-		if err != nil {
-			return bytesWritten, err
-		}
-		bytesWrittenTotal += bytesWritten
-	}
-	return
+	return &slotComponent
 }
 
-// DeserializeClusterSlotServerResp converts a stream into a redis response structure to CLUSTER slots request
+// NewSlotArrayFromComponent converts a stream into a redis response structure to CLUSTER slots request
 // https://redis.io/topics/protocol
-func DeserializeClusterSlotServerResp(reader io.Reader, buffer []byte) (servers []ClusterSlotResp, bytesRead int, err error) {
-	var components Componenter
-	components, bytesRead, err = ComponentFromReader(reader, buffer)
-	if err != nil {
-		return
-	}
-	if componentArray, ok := components.(*redisArray); !ok {
-		return nil, bytesRead, fmt.Errorf("expected an array, but got %v", components)
+func NewSlotArrayFromComponent(component Componenter) (servers []ClusterSlotResp, err error) {
+	if componentArray, ok := component.(*Array); !ok {
+		return nil, fmt.Errorf("expected an array, but got %v", component)
 	} else {
 		servers = make([]ClusterSlotResp, len(*componentArray))
 		for serverIndex, component := range *componentArray {
-			servers[serverIndex], err = deserializeSlot(component)
+			servers[serverIndex], err = NewSlotFromComponent(component)
 		}
-		return servers, bytesRead, nil
+		return servers, nil
 	}
 }
 
-func deserializeSlot(serverComponent Componenter) (slot ClusterSlotResp, err error) {
-	if componentArray, ok := serverComponent.(*redisArray); !ok {
+func NewSlotFromComponent(serverComponent Componenter) (slot ClusterSlotResp, err error) {
+	if componentArray, ok := serverComponent.(*Array); !ok {
 		return slot, fmt.Errorf("expected an array, but got %v", serverComponent)
 	} else {
 		if len(*componentArray) < 3 {
 			return slot, fmt.Errorf("expected slot object to contain at least 2 fields, but got: %d", len(*componentArray))
 		}
-		if rangeStart, ok := (*componentArray)[0].(*redisInt); !ok {
-			return slot, fmt.Errorf("expected slot object's component [0] to be type redisInt, but got: %v", (*componentArray)[0])
+		if rangeStart, ok := (*componentArray)[0].(*Int); !ok {
+			return slot, fmt.Errorf("expected slot object's component [0] to be type Int, but got: %v", (*componentArray)[0])
 		} else {
 			slot.rangeStart = rangeStart.Int()
 		}
-		if rangeEnd, ok := (*componentArray)[1].(*redisInt); !ok {
-			return slot, fmt.Errorf("expected slot object's component [1] to be type redisInt, but got: %v", (*componentArray)[1])
+		if rangeEnd, ok := (*componentArray)[1].(*Int); !ok {
+			return slot, fmt.Errorf("expected slot object's component [1] to be type Int, but got: %v", (*componentArray)[1])
 		} else {
 			slot.rangeEnd = rangeEnd.Int()
 		}

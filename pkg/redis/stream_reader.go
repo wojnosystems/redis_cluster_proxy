@@ -7,22 +7,7 @@ import (
 	"strconv"
 )
 
-type Componenter interface {
-}
-
-type redisArray []Componenter
-
-type redisInt int
-
-func (r redisInt) Int() int {
-	return int(r)
-}
-
-type redisString string
-
-func (r redisString) String() string {
-	return string(r)
-}
+const RecordSeparator = "\r\n"
 
 func ComponentFromReader(reader io.Reader, buffer []byte) (component Componenter, bytesReadTotal int, err error) {
 	var fieldType [1]byte
@@ -38,7 +23,7 @@ func ComponentFromReader(reader io.Reader, buffer []byte) (component Componenter
 	switch fieldType[0] {
 	case '*': // array
 		var arrayLenStr string
-		arrayLenStr, bytesRead, err = readFieldAsString(reader, buffer)
+		arrayLenStr, bytesRead, err = readFieldAsSimpleString(reader, buffer)
 		if err != nil {
 			return
 		}
@@ -48,13 +33,15 @@ func ComponentFromReader(reader io.Reader, buffer []byte) (component Componenter
 		if err != nil {
 			return
 		}
+		if arrayLength < 0 {
+			return NewNull(), bytesReadTotal, nil
+		}
 		array := make([]Componenter, arrayLength)
 		for componentIndex := range array {
 			array[componentIndex], bytesRead, err = ComponentFromReader(reader, buffer)
 			bytesReadTotal += bytesRead
 		}
-		arrayForReference := redisArray(array)
-		return &arrayForReference, bytesReadTotal, nil
+		return NewArrayFromComponenterSlice(array), bytesReadTotal, nil
 	case ':': // integer
 		var asInt int
 		asInt, bytesRead, err = readFieldAsInt(reader, buffer)
@@ -62,8 +49,7 @@ func ComponentFromReader(reader io.Reader, buffer []byte) (component Componenter
 			return
 		}
 		bytesReadTotal += bytesRead
-		intForReference := redisInt(asInt)
-		return &intForReference, bytesReadTotal, nil
+		return NewIntFromInt(asInt), bytesReadTotal, nil
 	case '$': // bulk string
 		var strLen int
 		strLen, bytesRead, err = readFieldAsInt(reader, buffer)
@@ -74,23 +60,29 @@ func ComponentFromReader(reader io.Reader, buffer []byte) (component Componenter
 		if strLen > cap(buffer) {
 			return nil, bytesReadTotal, fmt.Errorf("unable to read bulk-string with length %d as this exceeds our buffersize of %d", strLen, cap(buffer))
 		}
-		var theString string
-		theString, bytesRead, err = readFieldAsString(reader, buffer)
-		if err != nil {
-			return nil, bytesReadTotal, fmt.Errorf("unable to read Bulk String at offset: %d", bytesReadTotal)
+		if -1 == strLen {
+			return NewNullString(), bytesReadTotal, nil
 		}
+		var theString string
+		theString, bytesRead, err = readFieldAsBulkString(reader, buffer, strLen)
 		bytesReadTotal += bytesRead
-		stringForReference := redisString(theString)
-		return &stringForReference, bytesReadTotal, nil
+		return NewBulkStringFromString(theString), bytesReadTotal, nil
 	case '+': // simple string
 		var theString string
-		theString, bytesRead, err = readFieldAsString(reader, buffer)
+		theString, bytesRead, err = readFieldAsSimpleString(reader, buffer)
 		if err != nil {
 			return nil, bytesReadTotal, fmt.Errorf("unable to read Simple String at offset: %d", bytesReadTotal)
 		}
 		bytesReadTotal += bytesRead
-		stringForReference := redisString(theString)
-		return &stringForReference, bytesReadTotal, nil
+		return NewSimpleStringFromString(theString), bytesReadTotal, nil
+	case '-': // Error message
+		var theString string
+		theString, bytesRead, err = readFieldAsSimpleString(reader, buffer)
+		if err != nil {
+			return nil, bytesReadTotal, fmt.Errorf("unable to read Error Message at offset: %d", bytesReadTotal)
+		}
+		bytesReadTotal += bytesRead
+		return NewErrorFromString(theString), bytesReadTotal, nil
 	default:
 		return nil, bytesReadTotal, fmt.Errorf("unrecognized field type: '%c'", fieldType[0])
 	}
@@ -98,7 +90,20 @@ func ComponentFromReader(reader io.Reader, buffer []byte) (component Componenter
 
 var RecordEndMarker = []byte{'\r', '\n'}
 
-func readFieldAsString(reader io.Reader, buffer []byte) (fieldValue string, bytesReadTotal int, err error) {
+func readFieldAsInt(reader io.Reader, buffer []byte) (fieldValue int, bytesReadTotal int, err error) {
+	var intStr string
+	intStr, bytesReadTotal, err = readFieldAsSimpleString(reader, buffer)
+	if err != nil {
+		return
+	}
+	fieldValue, err = strconv.Atoi(intStr)
+	if err != nil {
+		return
+	}
+	return
+}
+
+func readFieldAsSimpleString(reader io.Reader, buffer []byte) (fieldValue string, bytesReadTotal int, err error) {
 	buffer = resetBuffer(buffer)
 	var bytesRead int
 	for bytesReadTotal < cap(buffer) {
@@ -117,14 +122,29 @@ func readFieldAsString(reader io.Reader, buffer []byte) (fieldValue string, byte
 	return string(buffer[0 : bytesReadTotal-len(RecordEndMarker)]), bytesReadTotal, nil
 }
 
-func readFieldAsInt(reader io.Reader, buffer []byte) (fieldValue int, bytesReadTotal int, err error) {
-	var intStr string
-	intStr, bytesReadTotal, err = readFieldAsString(reader, buffer)
+func readFieldAsBulkString(reader io.Reader, buffer []byte, stringLen int) (fieldValue string, bytesReadTotal int, err error) {
+	var bytesRead int
+	buffer = buffer[0:stringLen]
+	bytesRead, err = reader.Read(buffer)
 	if err != nil {
 		return
 	}
-	fieldValue, err = strconv.Atoi(intStr)
+	bytesReadTotal += bytesRead
+	if stringLen != bytesRead {
+		err = fmt.Errorf("error reading bulk string, did not read enough bytes")
+		return
+	}
+	fieldValue = string(buffer)
+
+	// read OK, consume the \r\n
+	buffer = buffer[0:len(RecordSeparator)]
+	bytesRead, err = reader.Read(buffer)
 	if err != nil {
+		return
+	}
+	bytesReadTotal += bytesRead
+	if len(RecordSeparator) != bytesRead {
+		err = fmt.Errorf("error reading bulk string, unable to read the record separator")
 		return
 	}
 	return
@@ -132,4 +152,41 @@ func readFieldAsInt(reader io.Reader, buffer []byte) (fieldValue int, bytesReadT
 
 func resetBuffer(buffer []byte) []byte {
 	return buffer[0:cap(buffer)]
+}
+
+func ComponentToStream(writer io.Writer, componenter Componenter) (totalBytesWritten int, err error) {
+	var bytesWritten int
+	switch componentType := componenter.(type) {
+	case *Array:
+		bytesWritten, err = fmt.Fprintf(writer, "*%d%s", len(*componentType), RecordSeparator)
+		if err != nil {
+			return
+		}
+		totalBytesWritten += bytesWritten
+		for _, value := range *componentType {
+			bytesWritten, err = ComponentToStream(writer, value)
+			if err != nil {
+				return
+			}
+			totalBytesWritten += bytesWritten
+		}
+	case *Int:
+		totalBytesWritten, err = fmt.Fprintf(writer, ":%d%s", componentType.Int(), RecordSeparator)
+	case *BulkString:
+		s := componentType.String()
+		totalBytesWritten, err = fmt.Fprintf(writer, "$%d%s%s%s", len(s), RecordSeparator, s, RecordSeparator)
+	case *SimpleString:
+		s := componentType.String()
+		totalBytesWritten, err = fmt.Fprintf(writer, "$%d%s%s%s", len(s), RecordSeparator, s, RecordSeparator)
+	case *Null:
+		totalBytesWritten, err = fmt.Fprintf(writer, "*-1%s", RecordSeparator)
+	case *NullString:
+		totalBytesWritten, err = fmt.Fprintf(writer, "$-1%s", RecordSeparator)
+	case *ErrorComp:
+		s := componentType.String()
+		totalBytesWritten, err = fmt.Fprintf(writer, "-%s%s", s, RecordSeparator)
+	default:
+		err = fmt.Errorf("unrecognized component type for object '%v'", componenter)
+	}
+	return
 }

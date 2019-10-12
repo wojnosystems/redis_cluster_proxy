@@ -7,9 +7,9 @@ type connEntry struct {
 	activeCount int
 }
 
-func newConnEntry(maxConnections int) *connEntry {
+func newConnEntry(maxIdleConnections int) *connEntry {
 	return &connEntry{
-		idle:        make([]net.Conn, 0, maxConnections),
+		idle:        make([]net.Conn, 0, maxIdleConnections),
 		activeCount: 0,
 	}
 }

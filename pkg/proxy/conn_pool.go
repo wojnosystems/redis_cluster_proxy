@@ -31,22 +31,29 @@ func (c *connPool) Dial(destinationAddr string) (conn net.Conn, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if connEntry, ok := c.pool[destinationAddr]; ok {
-		conn = connEntry.Get()
-	} else {
-		var newConn net.Conn
-		newConn, err = net.Dial("tcp", destinationAddr)
-		if err != nil {
-			return
+	if _, ok := c.pool[destinationAddr]; !ok {
+		c.pool[destinationAddr] = newConnEntry(c.maxConnectionsPerTarget)
+	}
+
+	connEntry := c.pool[destinationAddr]
+	if conn = connEntry.Get(); nil == conn {
+		// no idle connections
+		if connEntry.TotalOpenConnections() >= c.maxConnectionsPerTarget {
+			// Pool is full, don't create a new connection
+			return nil, ErrPoolDepleted
+		} else {
+			// We have room, add it as an Idle connection to track it, then get it
+			var newConn net.Conn
+			newConn, err = net.Dial("tcp", destinationAddr)
+			if err != nil {
+				return
+			}
+			connEntry.AddIdle(newConn)
+			c.pool[destinationAddr] = connEntry
+			conn = connEntry.Get()
 		}
-		connEntry := newConnEntry(c.maxConnectionsPerTarget)
-		connEntry.AddIdle(newConn)
-		c.pool[destinationAddr] = connEntry
-		conn = connEntry.Get()
 	}
-	if conn == nil {
-		return nil, ErrPoolDepleted
-	}
+
 	// wrap the connection so that it auto-returns to the pool when Close is called
 	conn = newPooledConnection(c, conn)
 	return

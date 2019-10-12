@@ -4,19 +4,20 @@ import (
 	"github.com/urfave/cli"
 	"log"
 	"os"
+	"os/signal"
 	"redis_cluster_proxy/pkg/ip_map"
 	"redis_cluster_proxy/pkg/port_pool"
 	"redis_cluster_proxy/pkg/proxy"
+	"syscall"
 )
 
 const (
-	UIntMax = 65535
-)
-
-const (
-	ListenAddrName  = "listenAddr"
-	ClusterAddrName = "clusterAddr"
-	PortStartName   = "portStart"
+	ListenAddrName               = "listenAddr"
+	ClusterAddrName              = "clusterAddr"
+	PublicHostnameName           = "publicHostname"
+	NumberOfBuffersName          = "numberOfBuffers"
+	MaxConcurrentConnectionsName = "maxConcurrentConnections"
+	ReadBufferByteSizeName       = "readBufferByteSize"
 )
 
 func buildArguments() *cli.App {
@@ -38,10 +39,40 @@ func buildArguments() *cli.App {
 					EnvVar:   "CLUSTER_ADDR",
 					Required: true,
 				},
+				cli.StringFlag{
+					Name:     PublicHostnameName,
+					EnvVar:   "PUBLIC_HOSTNAME",
+					Required: true,
+				},
+				cli.IntFlag{
+					Name:     NumberOfBuffersName,
+					EnvVar:   "NUM_BUFFERS",
+					Required: false,
+					Value:    1000,
+				},
+				cli.IntFlag{
+					Name:     MaxConcurrentConnectionsName,
+					EnvVar:   "MAX_CONNECTIONS",
+					Required: false,
+					Value:    100,
+				},
+				cli.IntFlag{
+					Name:     ReadBufferByteSizeName,
+					EnvVar:   "BUF_SIZE_BYTES",
+					Required: false,
+					Value:    4096,
+				},
 			},
 			Action: func(c *cli.Context) (err error) {
 				var redisProxy *proxy.Redis
-				redisProxy, err = newProxy(c.String(ListenAddrName), c.String(ClusterAddrName))
+				redisProxy, err = newProxy(
+					c.String(ListenAddrName),
+					c.String(ClusterAddrName),
+					c.String(PublicHostnameName),
+					c.Int(NumberOfBuffersName),
+					c.Int(MaxConcurrentConnectionsName),
+					c.Int(ReadBufferByteSizeName),
+				)
 
 				// Discovers the cluster ips and ports
 				err = redisProxy.DiscoverAndListen()
@@ -55,7 +86,9 @@ func buildArguments() *cli.App {
 					log.Fatal(err)
 				}
 
-				log.Fatal(redisProxy.WaitUntilAddConnectionsComplete())
+				exitChan := make(chan os.Signal, 1)
+				signal.Notify(exitChan, syscall.SIGINT, syscall.SIGKILL)
+				<-exitChan
 				return nil
 			},
 		},
@@ -63,7 +96,7 @@ func buildArguments() *cli.App {
 	return app
 }
 
-func newProxy(listenAddr, clusterAddr string) (redisProxy *proxy.Redis, err error) {
+func newProxy(listenAddr, clusterAddr, publicHostname string, numberOfBuffers int, maxConcurrentConnections int, readBufferByteSize int) (redisProxy *proxy.Redis, err error) {
 
 	listenHostWithPort, err := ip_map.NewHostWithPortFromString(listenAddr)
 	if err != nil {
@@ -76,5 +109,5 @@ func newProxy(listenAddr, clusterAddr string) (redisProxy *proxy.Redis, err erro
 
 	portKeeper := port_pool.NewCounter(listenHostWithPort.Port)
 
-	return proxy.NewRedis(listenHostWithPort, clusterHostWithPort, portKeeper), nil
+	return proxy.NewRedis(listenHostWithPort, clusterHostWithPort, publicHostname, portKeeper, numberOfBuffers, maxConcurrentConnections, readBufferByteSize), nil
 }

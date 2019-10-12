@@ -2,13 +2,28 @@ package redis
 
 import (
 	"fmt"
-	"io"
 )
 
 type ClusterServerResp struct {
 	ip   string
 	port uint16
 	id   string
+}
+
+func NewClusterServerResp(ip string, port uint16, id string) ClusterServerResp {
+	return ClusterServerResp{
+		ip:   ip,
+		port: port,
+		id:   id,
+	}
+}
+
+func NewClusterServerRespFromClusterServerResp(resp ClusterServerResp) ClusterServerResp {
+	return ClusterServerResp{
+		ip:   resp.ip,
+		port: resp.port,
+		id:   resp.id,
+	}
 }
 
 func (c ClusterServerResp) Ip() string {
@@ -27,38 +42,36 @@ func (c ClusterServerResp) Id() string {
 	return c.ip
 }
 
-func ClusterServerRespToRedisStream(writer io.Writer, c ClusterServerResp) (bytesWrittenTotal int, err error) {
-	var bytesWritten int
-	bytesWritten, err = fmt.Fprintf(writer, "*3\r\n$%d\r\n%s\r\n:%d\r\n$%d\r\n%s\r\n", len(c.ip), c.ip, c.port, len(c.id), c.id)
-	if err != nil {
-		return bytesWritten, err
-	}
-	bytesWrittenTotal += bytesWritten
-	return
+func ClusterServerRespToComponent(c ClusterServerResp) Componenter {
+	component := make(Array, 3)
+	component[0] = NewBulkStringFromString(c.ip)
+	component[1] = NewIntFromInt(int(c.port))
+	component[2] = NewBulkStringFromString(c.id)
+	return &component
 }
 
 func deserializeClusterServer(component Componenter) (server ClusterServerResp, err error) {
 	// Skipping the *3, all server records have 3 items: IP, port, and id
-	if componentArray, ok := component.(*redisArray); !ok {
-		return server, fmt.Errorf("expected server object to contain a redisArray, but got: %v", component)
+	if componentArray, ok := component.(*Array); !ok {
+		return server, fmt.Errorf("expected server object to contain a Array, but got: %v", component)
 	} else {
 		if len(*componentArray) != 3 {
-			return server, fmt.Errorf("expected server object to contain a redisArray of length exactly 3, but got: %d", len(*componentArray))
+			return server, fmt.Errorf("expected server object to contain a Array of length exactly 3, but got: %d", len(*componentArray))
 		}
 
-		if serverIp, ok := (*componentArray)[0].(*redisString); !ok {
+		if serverIp, ok := (*componentArray)[0].(*BulkString); !ok {
 			return server, fmt.Errorf("expected server IP field to be a string, but got %v", (*componentArray)[0])
 		} else {
 			server.ip = serverIp.String()
 		}
 
-		if serverPort, ok := (*componentArray)[1].(*redisInt); !ok {
+		if serverPort, ok := (*componentArray)[1].(*Int); !ok {
 			return server, fmt.Errorf("expected server port field to be an int, but got %v", (*componentArray)[1])
 		} else {
 			server.port = uint16(serverPort.Int())
 		}
 
-		if serverId, ok := (*componentArray)[2].(*redisString); !ok {
+		if serverId, ok := (*componentArray)[2].(*BulkString); !ok {
 			return server, fmt.Errorf("expected server ID field to be a string, but got %v", (*componentArray)[2])
 		} else {
 			server.id = serverId.String()

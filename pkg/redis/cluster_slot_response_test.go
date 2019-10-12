@@ -7,19 +7,19 @@ import (
 	"testing"
 )
 
-var clusterSlotResponseInputFixture string
-
 const BufferSizeBytes = 512
+
+var clusterSlotResponseInputFixture string
 
 func TestSerialize(t *testing.T) {
 	fixtureStream := bytes.NewBufferString(clusterSlotResponseInputFixture)
 	buffer := make([]byte, BufferSizeBytes)
-	decoded, _, err := DeserializeClusterSlotServerResp(fixtureStream, buffer)
+	decoded, _, err := ComponentFromReader(fixtureStream, buffer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	actualOutput := bytes.Buffer{}
-	_, err = ClusterSlotsRespToRedisStream(&actualOutput, decoded)
+	_, err = ComponentToStream(&actualOutput, decoded)
 	if err != nil {
 		t.Fatal(err)
 	}
