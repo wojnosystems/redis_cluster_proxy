@@ -6,7 +6,7 @@ This is, essentially, a Redis Cluster-aware NAT protocol.
 
 # Using it
 
-## In Docker
+## Standalone
 
 ```bash
 ./redisClusterProxyServer server -listenAddr :8000 -clusterAddr cluster:7000
@@ -22,7 +22,7 @@ There is a docker-compose.yaml in the root of the project. It using [grokzen's R
 docker-compose up
 ```
 
-Target your Redis Cluster client to: `127.0.0.1:8000`.
+Target your Redis Cluster client to: `127.0.0.1:8000`. This is actually the proxy. Use the docker-compose.yaml as a template for your projects.
 
 ### Commandline Flags / Environment
 
@@ -33,6 +33,17 @@ Target your Redis Cluster client to: `127.0.0.1:8000`.
  * **readBufferByteSize**/**BUF_SIZE_BYTES**: the size of the buffers. This should be set to the number of bytes of your largest Bulk String AKA your largest value stored in Redis 
 
 ### More on the setup
+
+```
+                  PUBLIC_HOST        LISTEN_ADDR       CLUSTER_ADDR
++-----------+     +------------+     +-------+         +------------+
+| Redis-cli | <-> | NAT/Docker | <-> | Redis | <--+--> | Redis Node |
++-----------+     | network    |     | Proxy |    |    +------------+
+                  +------------+     +-------+    |    +------------+
+                                                  +--> | Redis Node |
+                                                       +------------+
+                                                             ...
+```
 
 Suppose you have a [Redis Cluster](https://redis.io/topics/cluster-tutorial) with 3 masters and 3 replicas with the following IP addresses:
 
@@ -76,10 +87,6 @@ Listening on: :8005 proxy to: 172.23.0.2:7004
 
 Whenever a RedisCluster client connects to the proxy, the proxy will lie to it ;). Instead of sending the client the actual node IPs and ports, which are un-routable local addresses, it sends the client the IP and port of the proxy. Because the proxy is lying to the client, everything will magically work.
 
-# Example
-
-The included docker-compose.yaml file contains a simple configuration. Note the exposed ports on both the proxy and the actual cluster.
-
 # Purpose
 
 I needed a [Redis Cluster](https://redis.io/topics/cluster-tutorial) with at least 3 master nodes running in a Docker cluster as I was testing the JedisCluster (Java redis cluster SDK client). However, because Redis uses IP addresses when connecting to the cluster from a client and those IP addresses aren't routable outside of the cluster, it is not possible to access a redis cluster directly. However, by using a proxy with the ability to rename IP addresses, it is possible to support external connections.
@@ -98,17 +105,13 @@ I am only making a single Redis request to gather the cluster nodes to establish
 
 There are no timeouts. Again, don't use this in production.
 
-## Minimal resources
-
-Buffers are pre-allocated. There are 100 of them. After that, they're used it. I have plans to make this configurable, but that's not ready, yet.
-
-Concurrent connections to nodes is also limited to 10 for each cluster node. Again, I plan to make this configurable later.
-
-Buffer sizes are hard-coded to 1024.
-
 ## Lack of Online cluster resizing
 
-If you add or remove a shard from your cluster, this proxy doesn't do anything about that. You should probably start a new proxy pointing to the same hosts and then point your application to use the new proxy should you need an online resize. But you're not using this library for production, right? 
+If you add or remove a shard from your cluster, this proxy doesn't do anything about that. You should probably start a new proxy pointing to the same hosts and then point your application to use the new proxy should you need an online resize. But you're not using this library for production, right?
+
+# Future Work
+
+Break up the bi-directional proxy and make them aware of which side they're proxying traffic for. As of this writing, every request is de-serialized and interpreted by the proxy. We don't really need to do this. We need to listen for CLUSTER slots and MOVED command and error, respectively. Those messages need to be intercepted and re-written. Other messages should be passed without a full de-serialization.
 
 # Copyright
 
