@@ -24,6 +24,14 @@ docker-compose up
 
 Target your Redis Cluster client to: `127.0.0.1:8000`.
 
+### Environment Variables
+
+ * **listenAddr**: is the HOST_OR_IP:PORT that the proxy should listen to. This needs to be a private address or just leave the host part blank to use all available. The port must be free and for every node in the cluster of size n, the next n - 1 ports need to be available as the proxy will start listening for client connections on PORT, PORT+1, PORT+2... PORT+(n - 1)
+ * **clusterAddr**: This is the HOST_OR_IP:PORT of any node in the cluster. The other nodes will be auto-discovered
+ * **publicHost**: This is the HOST or IP (without port) of the proxy. Redis clients connecting to the proxy will be given this host so that they can dial back to the proxy
+ * **numberOfBuffers**: how many string buffers to allocate. Each connection to the proxy uses 2 buffers 
+ * **readBufferByteSize**: the size of the buffers. This should be set to the number of bytes of your largest Bulk String AKA your largest value stored in Redis 
+
 ### More on the setup
 
 Suppose you have a [Redis Cluster](https://redis.io/topics/cluster-tutorial) with 3 masters and 3 replicas with the following IP addresses:

@@ -12,12 +12,12 @@ import (
 )
 
 const (
-	ListenAddrName               = "listenAddr"
-	ClusterAddrName              = "clusterAddr"
-	PublicHostnameName           = "publicHostname"
-	NumberOfBuffersName          = "numberOfBuffers"
-	MaxConcurrentConnectionsName = "maxConcurrentConnections"
-	ReadBufferByteSizeName       = "readBufferByteSize"
+	ListenAddrFlagName               = "listenAddr"
+	ClusterAddrFlagName              = "clusterAddr"
+	PublicHostFlagName               = "publicHost"
+	NumberOfBuffersFlagName          = "numberOfBuffers"
+	MaxConcurrentConnectionsFlagName = "maxConcurrentConnections"
+	ReadBufferByteSizeFlagName       = "readBufferByteSize"
 )
 
 func buildArguments() *cli.App {
@@ -30,49 +30,59 @@ func buildArguments() *cli.App {
 			Description: "launches a proxy server that translates local ip addresses to the cluster-private IP addresses for a redis cluster",
 			Flags: []cli.Flag{
 				cli.StringFlag{
-					Name:     ListenAddrName,
+					Name:     ListenAddrFlagName,
 					EnvVar:   "LISTEN_ADDR",
 					Required: true,
+					Usage:    "HOST_OR_IP:PORT this is the first hostname/ipv4 and port to start listening for incoming connections from redis clients",
 				},
 				cli.StringFlag{
-					Name:     ClusterAddrName,
+					Name:     ClusterAddrFlagName,
 					EnvVar:   "CLUSTER_ADDR",
 					Required: true,
+					Usage:    "HOST_OR_IP:PORT this is how the proxy knows how to contact the cluster. This should be the address of any node in the cluster, the other nodes will be discovered by the proxy",
 				},
 				cli.StringFlag{
-					Name:     PublicHostnameName,
-					EnvVar:   "PUBLIC_HOSTNAME",
+					Name:     PublicHostFlagName,
+					EnvVar:   "PUBLIC_HOST",
 					Required: true,
+					Usage:    "HOST_OR_IP of the public address of the proxy. Clients connecting to the proxy will use this address to route traffic to the proxy",
 				},
 				cli.IntFlag{
-					Name:     NumberOfBuffersName,
+					Name:     NumberOfBuffersFlagName,
 					EnvVar:   "NUM_BUFFERS",
 					Required: false,
-					Value:    1000,
+					Value:    100,
+					Usage:    "[100] The number of buffers to allocate to the proxy for reading requests from clients and responses from servers",
 				},
 				cli.IntFlag{
-					Name:     MaxConcurrentConnectionsName,
+					Name:     MaxConcurrentConnectionsFlagName,
 					EnvVar:   "MAX_CONNECTIONS",
 					Required: false,
 					Value:    100,
+					Usage:    "Not activate at this time",
 				},
 				cli.IntFlag{
-					Name:     ReadBufferByteSizeName,
+					Name:     ReadBufferByteSizeFlagName,
 					EnvVar:   "BUF_SIZE_BYTES",
 					Required: false,
-					Value:    4096,
+					Value:    16384, // 16KB
+					Usage:    "[16384] the number of bytes that the read buffers are created with. Set this to the maximum size of any bulk string you need to send",
 				},
 			},
 			Action: func(c *cli.Context) (err error) {
 				var redisProxy *proxy.Redis
 				redisProxy, err = newProxy(
-					c.String(ListenAddrName),
-					c.String(ClusterAddrName),
-					c.String(PublicHostnameName),
-					c.Int(NumberOfBuffersName),
-					c.Int(MaxConcurrentConnectionsName),
-					c.Int(ReadBufferByteSizeName),
+					c.String(ListenAddrFlagName),
+					c.String(ClusterAddrFlagName),
+					c.String(PublicHostFlagName),
+					c.Int(NumberOfBuffersFlagName),
+					c.Int(MaxConcurrentConnectionsFlagName),
+					c.Int(ReadBufferByteSizeFlagName),
 				)
+
+				if err != nil {
+					log.Print(err)
+				}
 
 				// Discovers the cluster ips and ports
 				err = redisProxy.DiscoverAndListen()
@@ -87,8 +97,12 @@ func buildArguments() *cli.App {
 				}
 
 				exitChan := make(chan os.Signal, 1)
-				signal.Notify(exitChan, syscall.SIGINT, syscall.SIGKILL)
+				signal.Notify(exitChan, syscall.SIGINT, syscall.SIGKILL, syscall.SIGTERM)
 				<-exitChan
+				err = redisProxy.Close()
+				if err != nil {
+					log.Fatal(err)
+				}
 				return nil
 			},
 		},

@@ -16,17 +16,18 @@ import (
 )
 
 type Redis struct {
-	listenAddr     ip_map.HostWithPort
-	clusterAddr    ip_map.HostWithPort
-	publicHostname string
-	ipMap          *ip_map.Concurrent
-	portCounter    port_pool.Counter
-
+	listenAddr             ip_map.HostWithPort
+	clusterAddr            ip_map.HostWithPort
+	publicHostname         string
+	ipMap                  *ip_map.Concurrent
+	portCounter            port_pool.Counter
 	listenIPs              []net.IP
 	clusterIPs             []net.IP
 	facadeClusterSlotsResp []redisPkg.ClusterSlotResp
-
-	readBufferByteSize int
+	listeners              []net.Listener
+	buffers                *bufferPool
+	readBufferByteSize     int
+	debugOutputEnabled     bool
 }
 
 func NewRedis(listenAddr, clusterAddr ip_map.HostWithPort, publicHostname string, portKeeper port_pool.Counter, numberOfBuffers int, maxConcurrentConnections int, readBufferByteSize int) (redis *Redis) {
@@ -37,6 +38,8 @@ func NewRedis(listenAddr, clusterAddr ip_map.HostWithPort, publicHostname string
 		ipMap:              ip_map.NewConcurrent(),
 		portCounter:        portKeeper,
 		readBufferByteSize: readBufferByteSize,
+		listeners:          make([]net.Listener, 0, 6),
+		buffers:            newBufferPool(numberOfBuffers, readBufferByteSize),
 	}
 
 	return ret
@@ -56,7 +59,6 @@ const DiscoverStatement = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nslots\r\n"
 // When a request comes into 127.0.0.1, it needs to be forwarded to 172.20.0.2. The ports don't really matter so long as they are consistent.
 // When a client requests the mapping, we should respond with our own, internal mapping, based on the "listenAddr".
 func (r *Redis) DiscoverAndListen() (err error) {
-	log.Printf("Resolving clusterAddr: %s\n", r.clusterAddr.Host)
 	err = r.resolveClusterAddrIP()
 	if err != nil {
 		return
@@ -81,7 +83,12 @@ func (r *Redis) DiscoverAndListen() (err error) {
 		return
 	}
 
-	buffer := make([]byte, r.readBufferByteSize)
+	buffer := r.buffers.Get()
+	if buffer == nil {
+		err = fmt.Errorf("ran out of buffers")
+		return
+	}
+	defer r.buffers.Put(buffer)
 	responseComponent, _, err := redisPkg.ComponentFromReader(cluster, buffer)
 	if err != nil && io.EOF != err {
 		log.Println("io error while reading cluster socket: " + err.Error())
@@ -112,6 +119,7 @@ func (r *Redis) DiscoverAndListen() (err error) {
 			if err != nil {
 				return
 			}
+			r.listeners = append(r.listeners, nodeListener)
 			// create the mapping entry for the new socket
 			hostAndPort, _ := ip_map.NewHostWithPortFromString(nodeListener.Addr().String())
 			r.ipMap.Create(serverAddr, hostAndPort.Port)
@@ -173,6 +181,20 @@ func serverAddrAndPortFromSlotResp(clusterSlotResponses []redisPkg.ClusterSlotRe
 	return hostAndPort
 }
 
+func (r *Redis) Close() (err error) {
+	for _, listener := range r.listeners {
+		closeErr := listener.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}
+	return
+}
+
+func (r *Redis) SetDebug(enabled bool) {
+	r.debugOutputEnabled = enabled
+}
+
 func listenLoop(listener net.Listener, r *Redis, localAddr ip_map.HostWithPort) error {
 	for {
 		conn, err := listener.Accept()
@@ -189,19 +211,30 @@ func listenLoop(listener net.Listener, r *Redis, localAddr ip_map.HostWithPort) 
 }
 
 func proxyConnection(conn net.Conn, r *Redis, localAddr ip_map.HostWithPort) (err error) {
+	defer func() { _ = conn.Close() }()
 	clusterAddr, err := localToRemoteHostAndPort(r.ipMap, localAddr.Port)
 	if err != nil {
-		_ = conn.Close()
-		return
-	}
-	var clusterConn net.Conn
-	clusterConn, err = net.Dial("tcp", clusterAddr.String())
-	if err != nil {
-		_ = conn.Close()
 		return
 	}
 
-	log.Println("bi-directional proxy started")
+	var clusterConn net.Conn
+	clusterConn, err = net.Dial("tcp", clusterAddr.String())
+	if err != nil {
+		return
+	}
+	defer func() { _ = clusterConn.Close() }()
+
+	buffer1, buffer2, err := allocateBufferPair(r.buffers)
+	if err != nil {
+		return
+	}
+	defer func() {
+		r.buffers.Put(buffer1)
+		r.buffers.Put(buffer2)
+	}()
+
+	doneChan := make(chan error, 2)
+
 	Bidirectional(conn, clusterConn, func(componenterIn redisPkg.Componenter) (componenterOut redisPkg.Componenter) {
 		if componenterOut = mutateClusterSlotsCommand(componenterIn, r.facadeClusterSlotsResp, r.publicHostname, r.ipMap); nil != componenterOut {
 			return
@@ -214,9 +247,22 @@ func proxyConnection(conn net.Conn, r *Redis, localAddr ip_map.HostWithPort) (er
 		}
 		// no changes
 		return componenterIn
-	})
+	}, buffer1, buffer2, doneChan, r.debugOutputEnabled)
 
-	return nil
+	return <-doneChan
+}
+
+func allocateBufferPair(bufferPool *bufferPool) (buffer1, buffer2 []byte, err error) {
+	buffer1 = bufferPool.Get()
+	if buffer1 == nil {
+		return nil, nil, fmt.Errorf("ran out of buffers")
+	}
+	buffer2 = bufferPool.Get()
+	if buffer2 == nil {
+		bufferPool.Put(buffer1)
+		return nil, nil, fmt.Errorf("ran out of buffers")
+	}
+	return
 }
 
 func mutateMovedCommand(r *Redis, componenterIn redisPkg.Componenter) (componenterOut redisPkg.Componenter) {
@@ -299,10 +345,12 @@ func remoteToLocalHostAndPort(concurrent *ip_map.Concurrent, remoteAddr ip_map.H
 	return
 }
 
-func debugClientIn(label string, componenter redisPkg.Componenter) {
-	buffer := &bytes.Buffer{}
-	_, _ = redisPkg.ComponentToStream(buffer, componenter)
-	log.Println(label + ": \"" + strings.ReplaceAll(buffer.String(), "\r\n", "\\r\\n") + "\"")
+func debugClientIn(label string, debugOutputEnabled bool, componenter redisPkg.Componenter) {
+	if debugOutputEnabled {
+		buffer := &bytes.Buffer{}
+		_, _ = redisPkg.ComponentToStream(buffer, componenter)
+		log.Println(label + ": \"" + strings.ReplaceAll(buffer.String(), "\r\n", "\\r\\n") + "\"")
+	}
 }
 
 func isMoved(componenter redisPkg.Componenter) (parts []string, moved bool) {

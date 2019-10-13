@@ -17,7 +17,7 @@ WORKDIR /svc/redis-cluster-proxy
 ENV LISTEN_ADDR=":8000"
 ENV CLUSTER_ADDR="cluster:7000"
 ENV START_DELAY="0s"
-ENV PUBLIC_HOSTNAME="127.0.0.1"
+ENV PUBLIC_HOST="127.0.0.1"
 COPY docker/docker-entry-point.sh docker-entry-point.sh
 COPY --from=BUILDER /tmp/build/target/redisClusterProxyServer .
 CMD ["./docker-entry-point.sh"]

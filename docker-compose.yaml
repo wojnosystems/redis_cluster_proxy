@@ -12,7 +12,7 @@ services:
     environment:
       - LISTEN_ADDR=:8000
       - CLUSTER_ADDR=cluster:7000
-      - PUBLIC_HOSTNAME=127.0.0.1
+      - PUBLIC_HOST=127.0.0.1
       - START_DELAY=1s
     ports:
       - "8000:8000"
