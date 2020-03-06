@@ -24,6 +24,7 @@ type Redis struct {
 	listenIPs              []net.IP
 	clusterIPs             []net.IP
 	facadeClusterSlotsResp []redisPkg.ClusterSlotResp
+	facadeClusterNodesResp []redisPkg.ClusterNodeResp
 	listeners              []net.Listener
 	buffers                *bufferPool
 	readBufferByteSize     int
@@ -50,7 +51,8 @@ var MaxConnectRetries = retry.MaxAttempts{
 	WaitFor: 2 * time.Second,
 }
 
-const DiscoverStatement = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nslots\r\n"
+const ClusterSlotsDiscoverStatement = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nslots\r\n"
+const ClusterNodeDiscoverStatement = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n"
 
 // DiscoverAndListen contacts the cluster and gets the list of nodes, then establishes proxies for each node
 // When contacting redis, we get back a list of server addresses WITHIN the cluster These are private addresses)
@@ -77,27 +79,54 @@ func (r *Redis) DiscoverAndListen() (err error) {
 	// close the connection to Redis
 	defer func() { _ = cluster.Close() }()
 
-	_, err = cluster.Write([]byte(DiscoverStatement))
-	if err != nil && io.EOF != err {
-		log.Println("io error while writing to cluster socket: " + err.Error())
-		return
+	{
+		_, err = cluster.Write([]byte(ClusterSlotsDiscoverStatement))
+		if err != nil && io.EOF != err {
+			log.Println("io error while writing to cluster socket: " + err.Error())
+			return err
+		}
+
+		buffer := r.buffers.Get()
+		if buffer == nil {
+			err = fmt.Errorf("ran out of buffers")
+			return err
+		}
+		defer r.buffers.Put(buffer)
+		responseComponent, _, err := redisPkg.ComponentFromReader(cluster, buffer)
+		if err != nil && io.EOF != err {
+			log.Println("io error while reading cluster socket: " + err.Error())
+			return err
+		}
+		r.facadeClusterSlotsResp, err = redisPkg.NewSlotArrayFromComponent(responseComponent)
+		if err != nil {
+			log.Println("Unable to read the cluster response: " + err.Error())
+			return err
+		}
 	}
 
-	buffer := r.buffers.Get()
-	if buffer == nil {
-		err = fmt.Errorf("ran out of buffers")
-		return
-	}
-	defer r.buffers.Put(buffer)
-	responseComponent, _, err := redisPkg.ComponentFromReader(cluster, buffer)
-	if err != nil && io.EOF != err {
-		log.Println("io error while reading cluster socket: " + err.Error())
-		return
-	}
-	r.facadeClusterSlotsResp, err = redisPkg.NewSlotArrayFromComponent(responseComponent)
-	if err != nil {
-		log.Println("Unable to read the cluster response: " + err.Error())
-		return
+	{
+		_, err = cluster.Write([]byte(ClusterNodeDiscoverStatement))
+		if err != nil && io.EOF != err {
+			log.Println("io error while writing to cluster socket: " + err.Error())
+			return err
+		}
+
+		buffer := r.buffers.Get()
+		if buffer == nil {
+			err = fmt.Errorf("ran out of buffers")
+			return err
+		}
+		defer r.buffers.Put(buffer)
+		responseComponent, _, err := redisPkg.ComponentFromReader(cluster, buffer)
+		if err != nil && io.EOF != err {
+			log.Println("io error while reading cluster socket: " + err.Error())
+			return err
+		}
+		r.facadeClusterNodesResp, err = redisPkg.NewClusterNodesRespFromComponent(responseComponent)
+		if err != nil {
+			log.Println("Unable to read the cluster response: " + err.Error())
+			return err
+		}
 	}
 
 	serverAddrs := serverAddrAndPortFromSlotResp(r.facadeClusterSlotsResp)
@@ -239,6 +268,9 @@ func proxyConnection(conn net.Conn, r *Redis, localAddr ip_map.HostWithPort) (er
 		if componenterOut = mutateClusterSlotsCommand(componenterIn, r.facadeClusterSlotsResp, r.publicHostname, r.ipMap); nil != componenterOut {
 			return
 		}
+		if componenterOut = mutateClusterNodesCommand(componenterIn, r.facadeClusterNodesResp, r.publicHostname, r.ipMap); nil != componenterOut {
+			return
+		}
 		// nil means no interception, pass the query through
 		return nil
 	}, func(componenterIn redisPkg.Componenter) (componenterOut redisPkg.Componenter) {
@@ -310,14 +342,54 @@ func isClusterSlotsQuery(statements redisPkg.Componenter) bool {
 		if command, ok := (*array)[0].(*redisPkg.BulkString); !ok {
 			return false
 		} else {
-			if command.String() != "CLUSTER" {
+			if !strings.EqualFold(command.String(), "CLUSTER") {
 				return false
 			}
 		}
 		if command, ok := (*array)[1].(*redisPkg.BulkString); !ok {
 			return false
 		} else {
-			if command.String() != "slots" {
+			if !strings.EqualFold(command.String(), "SLOTS") {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func mutateClusterNodesCommand(componenterIn redisPkg.Componenter, clusterNodeResp []redisPkg.ClusterNodeResp, publicHostname string, lookup *ip_map.Concurrent) (componenterOut redisPkg.Componenter) {
+	if isClusterNodesQuery(componenterIn) {
+		nodes := redisPkg.NewClusterNodeRespFromClusterNodeRespArray(clusterNodeResp)
+		for nodeIndex := range nodes {
+			clusterAddr := ip_map.HostWithPort{Host: nodes[nodeIndex].Ip(), Port: nodes[nodeIndex].Port()}
+			localAddr, ok := lookup.RemoteToLocal(clusterAddr)
+			if !ok {
+				log.Println("no mapping from cluster address: " + clusterAddr.String())
+			}
+			// Lie to the client
+			nodes[nodeIndex].SetIp(publicHostname)
+			nodes[nodeIndex].SetPort(localAddr)
+		}
+		return redisPkg.ClusterNodeArrayToComponent(nodes)
+	}
+	return nil
+}
+
+func isClusterNodesQuery(statements redisPkg.Componenter) bool {
+	if array, ok := statements.(*redisPkg.Array); !ok {
+		return false
+	} else {
+		if command, ok := (*array)[0].(*redisPkg.BulkString); !ok {
+			return false
+		} else {
+			if !strings.EqualFold(command.String(), "CLUSTER") {
+				return false
+			}
+		}
+		if command, ok := (*array)[1].(*redisPkg.BulkString); !ok {
+			return false
+		} else {
+			if !strings.EqualFold(command.String(), "NODES") {
 				return false
 			}
 		}
