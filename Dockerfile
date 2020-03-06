@@ -12,7 +12,7 @@ RUN cd cmd/proxy && \
     CGO_ENABLED=0 go test -run="" /tmp/build/pkg/* && \
     go build -i -o /tmp/build/target/redisClusterProxyServer .
 
-FROM alpine:3.10.2
+FROM alpine:3.11.3
 WORKDIR /svc/redis-cluster-proxy
 ENV LISTEN_ADDR=":8000"
 ENV CLUSTER_ADDR="cluster:7000"

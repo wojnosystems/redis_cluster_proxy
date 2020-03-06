@@ -18,6 +18,7 @@ const (
 	NumberOfBuffersFlagName          = "numberOfBuffers"
 	MaxConcurrentConnectionsFlagName = "maxConcurrentConnections"
 	ReadBufferByteSizeFlagName       = "readBufferByteSize"
+	EnableDebuggingFlagName          = "debug"
 )
 
 func buildArguments() *cli.App {
@@ -68,6 +69,12 @@ func buildArguments() *cli.App {
 					Value:    16384, // 16KB
 					Usage:    "[16384] the number of bytes that the read buffers are created with. Set this to the maximum size of any bulk string you need to send",
 				},
+				cli.BoolFlag{
+					Name:     EnableDebuggingFlagName,
+					Usage:    "specify this flag to enable verbose output so you can see messages that the proxy intercepts and sends back out",
+					EnvVar:   "DEBUG",
+					Required: false,
+				},
 			},
 			Action: func(c *cli.Context) (err error) {
 				var redisProxy *proxy.Redis
@@ -83,6 +90,8 @@ func buildArguments() *cli.App {
 				if err != nil {
 					log.Print(err)
 				}
+
+				redisProxy.SetDebug(c.Bool(EnableDebuggingFlagName))
 
 				// Discovers the cluster ips and ports
 				err = redisProxy.DiscoverAndListen()

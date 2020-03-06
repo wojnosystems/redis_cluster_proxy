@@ -30,7 +30,8 @@ Target your Redis Cluster client to: `127.0.0.1:8000`. This is actually the prox
  * **clusterAddr**/**CLUSTER_ADDR**: This is the HOST_OR_IP:PORT of any node in the cluster. The other nodes will be auto-discovered
  * **publicHost**/**PUBLIC_HOST**: This is the HOST or IP (without port) of the proxy. Redis clients connecting to the proxy will be given this host so that they can dial back to the proxy
  * **numberOfBuffers**/**NUM_BUFFERS**: how many string buffers to allocate. Each connection to the proxy uses 2 buffers 
- * **readBufferByteSize**/**BUF_SIZE_BYTES**: the size of the buffers. This should be set to the number of bytes of your largest Bulk String AKA your largest value stored in Redis 
+ * **readBufferByteSize**/**BUF_SIZE_BYTES**: the size of the buffers. This should be set to the number of bytes of your largest Bulk String AKA your largest value stored in Redis
+ * **debug**: set this flag to enable verbose debugging. This will echo all communications through the proxy. This is extremely useful for testing. 
 
 ### More on the setup
 
@@ -62,7 +63,7 @@ When using the redisClusterProxy with a client such as [Jedis](https://github.co
 
 This reason this library exists is because if you want to connect to the cluster through a NAT or firewall where the nodes do not have public IP addresses, when the client connects, the client will get the private IP addresses and not the public addresses. When the client attempts to send a query to a node, this will fail because the IP is not routable as this is a private IP.
 
-The proxy works by creating local sockets to which the client will connect. The proxy intercepts the IP addresses and translates them to the listenAdd network.
+The proxy works by creating local sockets to which the client will connect. The proxy intercepts the IP addresses and translates them to the listenAddr network.
 
 If you're running in a docker-compose cluster (or any cluster, such as Kubernetes), you can start the redisClusterProxy and expose the number of ports needed to match your cluster. For example, the above cluster uses ports 7000-7005, so we need to open 6 ports on our proxy as well.
 
